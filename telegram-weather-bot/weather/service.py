@@ -180,7 +180,12 @@ def format_main_block(city_name: str, current: dict[str, Any]) -> str:
     code = cur.get("weather_code", 0)
     desc = _weather_description(code)
 
-    parts = [f"Погода в {city_name}", "", desc]
+    updated_at = cur.get("time")
+    header = f"Погода в {city_name}"
+    if updated_at:
+        header += f" (обновлено: {updated_at})"
+
+    parts = [header, "", desc]
 
     if temp is not None:
         parts.append("Температура: %+.0f°" % temp)
@@ -212,13 +217,67 @@ def assemble_full_message(
     daily: dict[str, Any] | None,
     timezone: str = "Europe/Moscow",
 ) -> str:
-    """Собирает основной блок и НМУ."""
-    blocks = [
-        format_main_block(city_name, current),
-        "",
-        "Параметры, требующие внимания",
-        format_nmu_block(get_nmu_warnings(current, daily)),
-    ]
+    """Собирает полный текст сообщения о погоде по требованиям бота."""
+    main_block = format_main_block(city_name, current)
+
+    # Блок погоды в течение дня и осадков по суточным данным
+    # Open-Meteo daily — поля-массивы; берём первый день
+    def _first(val: Any) -> Any:
+        if val is None:
+            return None
+        if isinstance(val, list) and len(val) > 0:
+            return val[0]
+        return val
+
+    daily_parts: list[str] = []
+    if daily:
+        t_min = _first(daily.get("temperature_2m_min"))
+        t_max = _first(daily.get("temperature_2m_max"))
+        precip_sum = _first(daily.get("precipitation_sum"))
+        precip_prob = _first(daily.get("precipitation_probability_max"))
+
+        if t_min is not None and t_max is not None:
+            daily_parts.append(
+                "Температура в течение дня: от %+.0f° до %+.0f°" % (t_min, t_max)
+            )
+
+        # Осадки за день и вероятность
+        if precip_sum is not None or precip_prob is not None:
+            precip_line = "Осадки за день"
+            if precip_sum is not None:
+                precip_line += f": {precip_sum:.1f} мм"
+            if precip_prob is not None:
+                precip_line += f", вероятность {int(precip_prob):d}%"
+            daily_parts.append(precip_line)
+
+    # Описание текущих осадков/состояния неба по коду
+    precip_now: str | None = None
+    code = current.get("weather_code", 0)
+    desc = _weather_description(code)
+    if code in WMO_HAZARDOUS:
+        precip_now = f"Текущее явление: {desc}"
+    elif code in WMO_FREEZING_RAIN:
+        precip_now = f"Текущие осадки: {desc} (возможен гололёд)"
+    elif code in WMO_RU:
+        precip_now = f"Сейчас: {desc}"
+
+    if precip_now:
+        daily_parts.insert(0, precip_now)
+
+    daily_block = "\n".join(daily_parts) if daily_parts else ""
+
+    nmu_block = format_nmu_block(get_nmu_warnings(current, daily))
+
+    blocks = [main_block]
+    if daily_block:
+        blocks.extend(["", daily_block])
+    blocks.extend(
+        [
+            "",
+            "Параметры, требующие внимания",
+            nmu_block,
+        ]
+    )
     return "\n".join(blocks)
 
 
@@ -249,6 +308,19 @@ def _agent_log(location: str, message: str, data: dict, hypothesis_id: str) -> N
     # #endregion
 
 
+def _session_log(message: str, data: dict, hypothesis_id: str) -> None:
+    # #region agent log
+    try:
+        ws = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        log_path = os.path.join(ws, "debug-bfb7f9.log")
+        payload = {"sessionId": "bfb7f9", "location": "weather/service.py", "message": message, "data": data, "hypothesisId": hypothesis_id, "timestamp": int(__import__("time").time() * 1000)}
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    # #endregion
+
+
 async def get_weather_message(city_id: str) -> str | None:
     """
     По id города получает погоду и возвращает готовое сообщение для пользователя.
@@ -259,12 +331,18 @@ async def get_weather_message(city_id: str) -> str | None:
     _agent_log("service.py:get_weather_message", "entry", {"city_id": city_id, "service_file": __file__}, "A")
     # #endregion
     city = get_city(city_id)
+    # #region agent log
+    _session_log("weather_flow", {"city_id": city_id, "city_found": city is not None}, "H1")
+    # #endregion
     if not city:
         # #region agent log
         _debug_log("get_city returned None", {"city_id": city_id, "hypothesisId": "B"})
         # #endregion
         return None
     data = await fetch_weather(city)
+    # #region agent log
+    _session_log("weather_flow", {"city_id": city_id, "fetch_ok": data is not None}, "H1")
+    # #endregion
     if not data:
         # #region agent log
         _debug_log("fetch_weather returned None", {"city_id": city_id, "hypothesisId": "B"})
